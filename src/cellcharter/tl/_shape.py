@@ -212,7 +212,7 @@ def _process_component(points, component, hole_area_ratio=0.1, alpha_start=None)
         alpha = 1 / alpha_start
 
         # Check if initial alpha returns valid shape
-        mesh = alphashape.alphashape(points, alpha, silent=True)
+        mesh = alphashape.alphashape(points, alpha)
         if isinstance(mesh, trimesh.base.Trimesh):
             is_valid = len(mesh.faces) > 0 and mesh.is_watertight and all(
                 trimesh.proximity.signed_distance(mesh, list(points)) >= 0)
