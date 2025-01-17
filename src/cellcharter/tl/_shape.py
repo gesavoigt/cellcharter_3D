@@ -211,6 +211,8 @@ def _process_component(points, component, hole_area_ratio=0.1, alpha_start=None)
             alpha_start = sys.float_info.min # must not be zero
         alpha = 1 / alpha_start
 
+        # TODO: what about shapes with enclosed holes? (relevant for purity etc)
+
         # Check if initial alpha returns valid shape
         mesh = alphashape.alphashape(points, alpha)
         if isinstance(mesh, trimesh.base.Trimesh):
@@ -429,17 +431,23 @@ def linearity(
 
 
 def _elongation(boundary):
-    # get the minimum bounding rectangle and zip coordinates into a list of point-tuples
-    mbr_points = list(zip(*boundary.minimum_rotated_rectangle.exterior.coords.xy))
+    if isinstance(boundary, geometry.Polygon): ## 2D
+        # get the minimum bounding rectangle and zip coordinates into a list of point-tuples
+        mbr_points = list(zip(*boundary.minimum_rotated_rectangle.exterior.coords.xy))
 
-    # calculate the length of each side of the minimum bounding rectangle
-    mbr_lengths = [geometry.LineString((mbr_points[i], mbr_points[i + 1])).length for i in range(len(mbr_points) - 1)]
+        # calculate the length of each side of the minimum bounding rectangle
+        mbr_lengths = [geometry.LineString((mbr_points[i], mbr_points[i + 1])).length for i in range(len(mbr_points) - 1)]
 
-    # get major/minor axis measurements
-    minor_axis = min(mbr_lengths)
-    major_axis = max(mbr_lengths)
-    return 1 - minor_axis / major_axis
+        # get major/minor axis measurements
+        minor_axis = min(mbr_lengths)
+        major_axis = max(mbr_lengths)
+        return 1 - minor_axis / major_axis
 
+    else: ## 3D
+        bbox = boundary.bounding_box_oriented
+        sides = np.array( bbox.primitive.extents )
+        sides.sort() # ascending
+        return 1 - (sides[1] / sides[2]) ## second longest / longest
 
 @d.dedent
 def elongation(
@@ -451,7 +459,8 @@ def elongation(
     """
     Compute the elongation of the topological boundaries of sets of cells.
 
-    It computes the minimum bounding rectangle of the polygon and divides the length of the minor axis by the length of the major axis.
+    It computes the minimum bounding rectangle (in 3D: box) of the boundary and divides the length of the minor axis by the length of the major axis
+    or, in 3D, the second longest side by the longest side.
 
     Parameters
     ----------
@@ -477,6 +486,99 @@ def elongation(
     if copy:
         return elongation_score
     adata.uns[f"shape_{cluster_key}"][out_key] = elongation_score
+
+def _flatness(mesh):
+    if not isinstance(mesh, trimesh.Trimesh):
+        return None
+    bbox = mesh.bounding_box_oriented # TODO check for valid box
+    sides = np.array( bbox.primitive.extents )
+    sides.sort() # ascending
+    return 1 - (sides[0] / sides[1]) ## shortest / second longest
+
+@d.dedent
+def flatness(
+    adata: AnnData,
+    cluster_key: str = "component",
+    out_key: str = "flatness",
+    copy: bool = False,
+) -> None | dict[int, float]:
+    """
+    Compute the flatness of the 3D topological boundaries of sets of cells.
+
+    It computes the oriented minimum bounding box of the boundary and divides the length of the shortest side by the length of the second longest side.
+
+    Parameters
+    ----------
+    %(adata)s
+    cluster_key
+        Key in :attr:`anndata.AnnData.obs` where the cluster labels are stored.
+    out_key
+        Key in :attr:`anndata.AnnData.obs` where the metric values are stored if ``copy = False``.
+    %(copy)s
+    Returns
+    -------
+    If ``copy = True``, returns a :class:`dict` with the cluster labels as keys and the flatness as values.
+
+    Otherwise, modifies the ``adata`` with the following key:
+        - :attr:`anndata.AnnData.uns` ``['shape_{{cluster_key}}']['{{out_key}}']`` - - the above mentioned :class:`dict`.
+    """
+    boundaries = adata.uns[f"shape_{cluster_key}"]["boundary"]
+
+    flatness_score = {}
+    for cluster, boundary in boundaries.items():
+        flatness_score[cluster] = _flatness(boundary)
+
+    if copy:
+        return flatness_score
+    adata.uns[f"shape_{cluster_key}"][out_key] = flatness_score
+
+def _sphericity(mesh):
+    if not isinstance(mesh, trimesh.Trimesh):
+        return None
+    if not mesh.is_watertight:
+        return None
+    volume = mesh.volume
+    area = mesh.area
+    if area == 0:
+        return None
+    return ( (np.pi**(1/3) * ((6*volume)**(2/3))) / area )
+
+@d.dedent
+def sphericity(
+    adata: AnnData,
+    cluster_key: str = "component",
+    out_key: str = "sphericity",
+    copy: bool = False,
+) -> None | dict[int, float]:
+    """
+    Compute the sphericity of the 3D topological boundaries of sets of cells.
+
+    Sphericity is computed following the definition by Wadell (1935), which uses the area and volume of the alpha shape.
+
+    Parameters
+    ----------
+    %(adata)s
+    cluster_key
+        Key in :attr:`anndata.AnnData.obs` where the cluster labels are stored.
+    out_key
+        Key in :attr:`anndata.AnnData.obs` where the metric values are stored if ``copy = False``.
+    %(copy)s
+    Returns
+    -------
+    If ``copy = True``, returns a :class:`dict` with the cluster labels as keys and the sphericity as values.
+
+    Otherwise, modifies the ``adata`` with the following key:
+        - :attr:`anndata.AnnData.uns` ``['shape_{{cluster_key}}']['{{out_key}}']`` - - the above mentioned :class:`dict`.
+    """
+    boundaries = adata.uns[f"shape_{cluster_key}"]["boundary"]
+
+    sphericity_score = {}
+    for cluster, boundary in boundaries.items():
+        sphericity_score[cluster] = _sphericity(boundary)
+
+    if copy:
+        return sphericity_score
+    adata.uns[f"shape_{cluster_key}"][out_key] = sphericity_score
 
 
 def _axes(boundary):
@@ -576,19 +678,21 @@ def purity(
         sample = adata[adata.obs[cluster_key] == cluster].obs[library_key][0]
         adata_sample = adata[adata.obs[library_key] == sample]
 
-        points = adata_sample.obsm["spatial"][:, :2]
-        within_mask = np.zeros(points.shape[0], dtype=bool)
-        if type(boundary) is geometry.multipolygon.MultiPolygon:
-            for p in boundary.geoms:
-                path = Path(np.array(p.exterior.coords.xy).T)
+        points = adata_sample.obsm["spatial"]
+        if points.shape[1] == 2:
+            within_mask = np.zeros(points.shape[0], dtype=bool)
+            if type(boundary) is geometry.multipolygon.MultiPolygon:
+                for p in boundary.geoms:
+                    path = Path(np.array(p.exterior.coords.xy).T)
+                    within_mask |= np.array(path.contains_points(points))
+            else:
+                path = Path(np.array(boundary.exterior.coords.xy).T)
                 within_mask |= np.array(path.contains_points(points))
-        else:
-            path = Path(np.array(boundary.exterior.coords.xy).T)
-            within_mask |= np.array(path.contains_points(points))
-            if not exterior:
-                for interior in boundary.interiors:
-                    path = Path(np.array(interior.coords.xy).T)
-                    within_mask &= ~np.array(path.contains_points(points))
+                if not exterior:
+                    for interior in boundary.interiors:
+                        path = Path(np.array(interior.coords.xy).T)
+                        within_mask &= ~np.array(path.contains_points(points))
+    #    else: # 3D
 
         purity_score[cluster] = np.sum(adata_sample.obs[cluster_key][within_mask] == cluster) / np.sum(within_mask)
 
