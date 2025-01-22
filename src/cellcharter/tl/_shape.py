@@ -165,6 +165,13 @@ def _alpha_shape_2D(coords, alpha):
     triangles = list(polygonize(m.geoms))
     return unary_union(triangles), triangles, edge_points
 
+def _mesh_is_valid(
+    mesh: trimesh.Trimesh,
+    points: np.ndarray
+    ) -> bool:
+    return len(mesh.faces) > 0 and mesh.is_watertight and all(
+        trimesh.proximity.signed_distance(mesh, list(points)) >= 0 )
+
 def _process_component(points, component, hole_area_ratio=0.1, alpha_start=None):
     """
     Guide the alpha shape creation.
@@ -208,7 +215,7 @@ def _process_component(points, component, hole_area_ratio=0.1, alpha_start=None)
 
     else: # 3D
         if alpha_start is None:
-            alpha_start = sys.float_info.min # must not be zero
+            alpha_start = sys.float_info.min # must be > 0
         alpha = 1 / alpha_start
 
         # TODO: what about shapes with enclosed holes? (relevant for purity etc)
@@ -216,18 +223,31 @@ def _process_component(points, component, hole_area_ratio=0.1, alpha_start=None)
         # Check if initial alpha returns valid shape
         mesh = alphashape.alphashape(points, alpha)
         if isinstance(mesh, trimesh.base.Trimesh):
-            is_valid = len(mesh.faces) > 0 and mesh.is_watertight and all(
-                trimesh.proximity.signed_distance(mesh, list(points)) >= 0)
-            if is_valid:
+            if _mesh_is_valid(mesh, points):
                 return component, mesh
 
         # Otherwise, optimize alpha
-        component, alpha = _alphashape_optimizealpha(points, component, silent=True)
-        if not np.isnan(alpha):
-            mesh = alphashape.alphashape(points, alpha)
-            return component, mesh
-        else:
-            return component, None
+        # Using manual optimization, which is faster than alphashape.optimizealpha
+        # but might result in a slightly larger alpha
+        factor_increase = 2
+        factor_decrease = .75
+        n_iter = 10
+        # Increase alpha until valid shape is found
+        while not _mesh_is_valid(mesh, points):
+            alpha *= factor_increase
+            mesh = alphashape.alphashape(points, alpha=1/alpha)
+        # Decrease alpha until invalid shape is found
+        alpha0 = alpha
+        mesh0 = mesh.copy()
+        for i in range(n_iter):
+            alpha1 = alpha0 * factor_decrease
+            mesh1 = alphashape.alphashape(points, alpha=1/alpha1)
+            if not _mesh_is_valid(mesh1, points): ## invalid, return previous mesh
+                return component, mesh0
+            else: ## still valid, could be reduced more
+                alpha0 = alpha1
+                mesh0 = mesh1.copy()
+        return component, mesh0 ## return the last valid mesh
 
 @d.dedent
 def boundaries(
