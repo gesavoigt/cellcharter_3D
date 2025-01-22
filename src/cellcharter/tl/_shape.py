@@ -454,7 +454,7 @@ def linearity(
     # Determine default height from type of boundary
     if height is None:
         for boundary in boundaries.values():
-            if isinstance(boundary, geometry.Polygon):
+            if isinstance(boundary, geometry.Polygon) | isinstance(boundary, geometry.MultiPolygon):
                 dim = 2
                 height = 1000
                 break
@@ -476,7 +476,7 @@ def linearity(
 
 
 def _elongation(boundary):
-    if isinstance(boundary, geometry.Polygon): ## 2D
+    if isinstance(boundary, geometry.Polygon) | isinstance(boundary, geometry.MultiPolygon): ## 2D
         # get the minimum bounding rectangle and zip coordinates into a list of point-tuples
         mbr_points = list(zip(*boundary.minimum_rotated_rectangle.exterior.coords.xy))
 
