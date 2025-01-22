@@ -24,8 +24,8 @@ def _alphashape_optimizealpha(
     points: np.ndarray,
     component: int,
     max_iterations: int = 10000,
-    lower: float = None,
-    upper: float = None,
+    lower: float | None = None,
+    upper: float | None = None,
     silent: bool = False
 ):
     """
@@ -71,8 +71,8 @@ def alphashape_optimize(
     adata: AnnData,
     component_key: str = 'component',
     max_iterations: int = 10000,
-    lower: float = None,
-    upper: float = None,
+    lower: float | None = None,
+    upper: float | None = None,
     silent: bool = False,
 ) -> tuple([ dict[int, float] , dict[int, trimesh.Trimesh] ]) | tuple([ dict[int, float] , dict[int, geometry.Polygon] ]):
     """
@@ -408,7 +408,7 @@ def linearity(
     adata: AnnData,
     cluster_key: str = "component",
     out_key: str = "linearity",
-    height: int = 1000,
+    height: int | None = None,
     min_ratio: float = 0.05,
     copy: bool = False,
 ) -> None | dict[int, float]:
@@ -427,7 +427,7 @@ def linearity(
     out_key
         Key in :attr:`anndata.AnnData.obs` where the metric values are stored if ``copy = False``.
     height
-        Height of the rasterized image. The width is computed automatically to preserve the aspect ratio of the polygon. Higher values lead to more precise results but also higher memory usage.
+        Height of the rasterized image. The width is computed automatically to preserve the aspect ratio of the polygon. Higher values lead to more precise results but also higher memory usage. Default for 2D data is 1000, for 3D data 100.
     min_ratio
         Minimum ratio between the length of a branch and the total length of the skeleton to be considered a real branch and not be removed.
     %(copy)s
