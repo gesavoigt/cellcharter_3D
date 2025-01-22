@@ -374,9 +374,20 @@ def _longest_path_length(graph):
     return longest_path_length
 
 
-def _linearity(boundary, height=1000, min_ratio=0.05):
-    img, _ = _rasterize(boundary, height=height)
-    skeleton = skeletonize(img).astype(int)
+def _linearity(boundary, dim, height, min_ratio=0.05):
+    if dim == 2:
+        # Scale and rasterize
+        img, _ = _rasterize(boundary, height=height)
+    else:
+        # Turn into voxel grid, scale by setting voxel side length
+        # TODO tests
+        bbox_sides = boundary.bounding_box.extents # axis-aligned, as voxels will be, too
+        voxel_length = bbox_sides.max() / height
+        voxelized = boundary.voxelized(voxel_length)
+        voxelized = voxelized.fill(method='holes')
+        img = voxelized.matrix*1
+
+    skeleton = skeletonize(img).astype(int) ## will use method='lee' for 3D by default
 
     graph = sknw.build_sknw(skeleton.astype(np.uint16))
     graph = graph.to_undirected()
@@ -427,7 +438,7 @@ def linearity(
     out_key
         Key in :attr:`anndata.AnnData.obs` where the metric values are stored if ``copy = False``.
     height
-        Height of the rasterized image. The width is computed automatically to preserve the aspect ratio of the polygon. Higher values lead to more precise results but also higher memory usage. Default for 2D data is 1000, for 3D data 100.
+        Height of the rasterized image. The lengths of the other side(s) is/are computed automatically to preserve the aspect ratio of the shape. Higher values lead to more precise results but also higher memory usage. Default for 2D data is 1000, for 3D data 100.
     min_ratio
         Minimum ratio between the length of a branch and the total length of the skeleton to be considered a real branch and not be removed.
     %(copy)s
@@ -440,9 +451,23 @@ def linearity(
     """
     boundaries = adata.uns[f"shape_{cluster_key}"]["boundary"]
 
+    # Determine default height from type of boundary
+    if height is None:
+        for boundary in boundaries.values():
+            if isinstance(boundary, geometry.Polygon):
+                dim = 2
+                height = 1000
+                break
+            elif isinstance(boundary, trimesh.Trimesh):
+                dim = 3
+                height = 100
+                break
+        if height is None:
+            return None ## no valid boundary objects
+
     linearity_score = {}
     for cluster, boundary in boundaries.items():
-        linearity_score[cluster] = _linearity(boundary, height=height, min_ratio=min_ratio)
+        linearity_score[cluster] = _linearity(boundary, dim=dim, height=height, min_ratio=min_ratio)
 
     if copy:
         return linearity_score
