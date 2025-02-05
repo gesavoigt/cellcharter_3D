@@ -737,9 +737,20 @@ def purity(
                     for interior in boundary.interiors:
                         path = Path(np.array(interior.coords.xy).T)
                         within_mask &= ~np.array(path.contains_points(points))
-    #    else: # 3D
+            purity_score[cluster] = np.sum(adata_sample.obs[cluster_key][within_mask] == cluster) / np.sum(within_mask)
 
-        purity_score[cluster] = np.sum(adata_sample.obs[cluster_key][within_mask] == cluster) / np.sum(within_mask)
+        else: # 3D
+            # Subset points to within bounding box of boundary -> fewer dist. calculations -> faster
+            bbox = boundary.bounding_box
+            ((min_x, min_y, min_z), (max_x, max_y, max_z)) = bbox.bounds
+            within_box = (points[:,0] >= min_x) & (points[:,0] <= max_x) & (points[:,1] >= min_y) & (points[:,1] <= max_y) & (points[:,2] >= min_z) & (points[:,2] <= max_z)
+            is_cluster = adata_sample.obs[cluster_key] == cluster
+            points_other = np.array(points)[ within_box & (~is_cluster) , :] # only points that are not part of cluster
+            # Compute signed distances: positive if inside, negative if outside
+            within_mask_other = trimesh.proximity.ProximityQuery( boundary ).signed_distance(points_other) > 0
+
+            purity_score[cluster] = np.sum(is_cluster) / ( np.sum(is_cluster) + np.sum(within_mask_other) )
+
 
     if copy:
         return purity_score
