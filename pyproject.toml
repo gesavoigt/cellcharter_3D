@@ -10,7 +10,7 @@ exclude = [
 
 [project]
 name = "cellcharter"
-version = "0.3.2"
+version = "0.3.3"
 description = "A Python package for the identification, characterization and comparison of spatial clusters from spatial -omics data."
 readme = "README.md"
 requires-python = ">=3.8,<3.13"
@@ -25,14 +25,15 @@ urls.Documentation = "https://cellcharter.readthedocs.io/"
 urls.Source = "https://github.com/CSOgroup/cellcharter"
 urls.Home-page = "https://github.com/CSOgroup/cellcharter"
 dependencies = [
-    "anndata < 0.11.0",
+    "anndata",
     "scikit-learn",
     "squidpy",
-    "torchgmm",
+    "torchgmm >= 0.1.2",
     # for debug logging (referenced from the issue template)
     "session-info",
-    "spatialdata",
-    "spatialdata-plot >= 0.1.0",
+    "dask < 2025.1.0",
+    "spatialdata < 0.2.6",
+    "spatialdata-plot < 0.2.8",
     "rasterio",
     "sknw",
     "matplotlib < 3.9.0",
