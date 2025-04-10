@@ -306,76 +306,58 @@ def boundaries(
 
     adata.uns[f"shape_{cluster_key}"] = {"boundary": boundaries}
 
-
-def _find_dangling_branches(graph, total_length, min_ratio=0.05):
-    adj = nx.to_numpy_array(graph, weight=None, nodelist=list(graph.nodes))
-    adj_w = nx.to_numpy_array(graph, nodelist=list(graph.nodes))
-
-    n_neighbors = np.sum(adj, axis=1)
-    node_total_dist = np.sum(adj_w, axis=1)
-    nodes = list(graph.nodes)
-
-    dangling_nodes = [
-        nodes[i]
-        for i in range(len(nodes))
-        if (node_total_dist[i] < min_ratio * total_length and n_neighbors[i] == 1)
-    ]
-
-    return dangling_nodes
-
-def _remove_dangling_branches(graph, min_ratio=0.05):
-    total_length = np.sum(list(nx.get_edge_attributes(graph, "weight").values()))
-
-    dangling_branches = _find_dangling_branches(graph, total_length=total_length, min_ratio=min_ratio)
-
-    while len(dangling_branches) > 0:
-        for node in dangling_branches:
-            if graph.has_node(node):
-                graph.remove_node(node)
-
-        dangling_branches = _find_dangling_branches(graph, total_length=total_length, min_ratio=min_ratio)
-
-
-def _longest_path_from_node(graph, u):
-    visited = dict.fromkeys(graph.nodes)
-    distance = {i: -1 for i in list(graph.nodes)}
-    idx2node = dict(enumerate(graph.nodes))
-
-    try:
-        adj_lil = nx.to_scipy_sparse_matrix(graph, format="lil")
-    except AttributeError:
-        adj_lil = nx.to_scipy_sparse_array(graph, format="lil")
-    adj = {i: [idx2node[neigh] for neigh in neighs] for i, neighs in zip(graph.nodes, adj_lil.rows)}
+def _find_longest_simple_path(graph: nx.Graph) -> list:
+    """Find the longest simple path in a graph using DFS (brute-force)."""
+    longest_path = []
+    longest_length = 0
     weight = nx.get_edge_attributes(graph, "weight")
 
-    distance[u] = 0
-    queue = deque()
-    queue.append(u)
-    visited[u] = True
-    while queue:
-        front = queue.popleft()
-        for i in adj[front]:
-            if not visited[i]:
-                visited[i] = True
-                source, target = min(i, front), max(i, front)
-                distance[i] = distance[front] + weight[(source, target)]
-                queue.append(i)
+    def dfs(node, visited, path, length):
+        nonlocal longest_path, longest_length
+        visited.add(node)
+        path.append(node)
+        if length > longest_length:
+            longest_length = length
+            longest_path = list(path)
 
-    farthest_node = max(distance, key=distance.get)
+        for neighbor in graph.neighbors(node):
+            if neighbor not in visited:
+                edge = (min(node, neighbor), max(node, neighbor))
+                dfs(neighbor, visited, path, length + weight.get(edge, 1))
+        path.pop()
+        visited.remove(node)
 
-    longest_path_length = distance[farthest_node]
-    return farthest_node, longest_path_length
+    for start_node in graph.nodes:
+        dfs(start_node, set(), [], 0)
 
+    return longest_path
 
-def _longest_path_length(graph):
-    # first DFS to find one end point of longest path
-    node, _ = _longest_path_from_node(graph, list(graph.nodes)[0])
-    # second DFS to find the actual longest path
-    _, longest_path_length = _longest_path_from_node(graph, node)
-    return longest_path_length
+def _prune_graph(
+        graph: nx.Graph,
+        total_length:float,
+        longest_path_nodes:set,
+        min_ratio=0.05
+    ) -> nx.Graph:
 
+    nodes_to_remove = []
+    for node in graph.nodes:
+        if node not in longest_path_nodes:
+            # Consider node's total edge weight
+            edge_weights = [
+                graph.edges[(node, nbr)]['weight']
+                for nbr in graph.neighbors(node)
+                if (node, nbr) in graph.edges or (nbr, node) in graph.edges
+            ]
+            node_total_weight = np.sum(edge_weights)
+            if node_total_weight < min_ratio * total_length:
+                nodes_to_remove.append(node)
+
+    pruned_graph = graph.copy()
+    pruned_graph.remove_nodes_from(nodes_to_remove)
+    return pruned_graph
 
 def _linearity(boundary, dim, height, min_ratio=0.05):
+    # Voxelize or rasterize the boundary
     if dim == 2:
         # Scale and rasterize
         img, _ = _rasterize(boundary, height=height)
@@ -388,20 +370,25 @@ def _linearity(boundary, dim, height, min_ratio=0.05):
         voxelized = voxelized.fill(method='holes')
         img = voxelized.matrix*1
 
+    # Skeletonize & encode skeleton as graph
     skeleton = skeletonize(img).astype(int) ## will use method='lee' for 3D by default
-
     graph = sknw.build_sknw(skeleton.astype(np.uint16))
     graph = graph.to_undirected()
 
-    _remove_dangling_branches(graph, min_ratio=min_ratio)
+    # Find longest path (acyclic)
+    longest_path = _find_longest_simple_path(graph)
+    longest_path_nodes = set(longest_path)
 
-    cycles = nx.cycle_basis(graph)
-    cycles_len = [nx.path_weight(graph, cycle + [cycle[0]], "weight") for cycle in cycles]
+    # Prune 'spurious' branches while protecting the longest path
+    # Note: This will not remove branches that are part of cycles
+    total_length = np.sum(list(nx.get_edge_attributes(graph, "weight").values())) # unpruned
+    pruned_graph = _prune_graph(graph, total_length, longest_path_nodes, min_ratio=min_ratio)
 
-    longest_path_length = _longest_path_length(graph)
-    longest_length = np.max(cycles_len + [longest_path_length])
+    # Compute the linearity score: longest path length / total length of the pruned graph
+    path_length = nx.path_weight(pruned_graph, longest_path, weight="weight")
+    total_length = np.sum(list(nx.get_edge_attributes(pruned_graph, "weight").values())) # pruned
 
-    return longest_length / np.sum(list(nx.get_edge_attributes(graph, "weight").values()))
+    return ( path_length / total_length if total_length > 0 else 0. )
 
 
 def _rasterize(boundary, height=1000):
@@ -453,18 +440,15 @@ def linearity(
     boundaries = adata.uns[f"shape_{cluster_key}"]["boundary"]
 
     # Determine default height from type of boundary
-    if height is None:
-        for boundary in boundaries.values():
-            if isinstance(boundary, geometry.Polygon) | isinstance(boundary, geometry.MultiPolygon):
-                dim = 2
-                height = 1000
-                break
-            elif isinstance(boundary, trimesh.Trimesh):
-                dim = 3
-                height = 100
-                break
-        if height is None:
-            return None ## no valid boundary objects
+    # Cave: assuming all input boundary objects are of the same dimensionality
+    if isinstance(boundaries[0], geometry.Polygon) | isinstance(boundaries[0], geometry.MultiPolygon):
+        dim = 2
+        height = 1000
+    elif isinstance(boundaries[0], trimesh.Trimesh):
+        dim = 3
+        height = 100
+    else:
+        raise ValueError("Unknown boundary type. Must be either 2D or 3D.")
 
     linearity_score = {}
     for cluster, boundary in boundaries.items():
