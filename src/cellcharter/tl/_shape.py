@@ -308,19 +308,20 @@ def boundaries(
 
 
 def _find_dangling_branches(graph, total_length, min_ratio=0.05):
-    total_length = np.sum(list(nx.get_edge_attributes(graph, "weight").values()))
-    adj = nx.to_numpy_array(graph, weight=None)
-    adj_w = nx.to_numpy_array(graph)
+    adj = nx.to_numpy_array(graph, weight=None, nodelist=list(graph.nodes))
+    adj_w = nx.to_numpy_array(graph, nodelist=list(graph.nodes))
 
     n_neighbors = np.sum(adj, axis=1)
     node_total_dist = np.sum(adj_w, axis=1)
-    dangling_nodes = np.argwhere((node_total_dist < min_ratio * total_length) & (n_neighbors == 1))
-    if dangling_nodes.shape[0] != 1:
-        dangling_nodes = dangling_nodes.squeeze()
-    else:
-        dangling_nodes = dangling_nodes[0]
-    return dangling_nodes
+    nodes = list(graph.nodes)
 
+    dangling_nodes = [
+        nodes[i]
+        for i in range(len(nodes))
+        if (node_total_dist[i] < min_ratio * total_length and n_neighbors[i] == 1)
+    ]
+
+    return dangling_nodes
 
 def _remove_dangling_branches(graph, min_ratio=0.05):
     total_length = np.sum(list(nx.get_edge_attributes(graph, "weight").values()))
@@ -328,9 +329,9 @@ def _remove_dangling_branches(graph, min_ratio=0.05):
     dangling_branches = _find_dangling_branches(graph, total_length=total_length, min_ratio=min_ratio)
 
     while len(dangling_branches) > 0:
-        idx2node = dict(enumerate(graph.nodes))
-        for i in dangling_branches:
-            graph.remove_node(idx2node[i])
+        for node in dangling_branches:
+            if graph.has_node(node):
+                graph.remove_node(node)
 
         dangling_branches = _find_dangling_branches(graph, total_length=total_length, min_ratio=min_ratio)
 
