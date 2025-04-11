@@ -11,6 +11,7 @@ from anndata import AnnData
 from matplotlib.path import Path
 from rasterio import features
 from scipy.spatial import Delaunay
+from scipy.optimize import root_scalar
 from shapely import geometry
 from shapely.ops import polygonize, unary_union
 from skimage.morphology import skeletonize
@@ -330,7 +331,7 @@ def _find_longest_simple_path(graph: nx.Graph) -> list:
     for start_node in graph.nodes:
         dfs(start_node, set(), [], 0)
 
-    return longest_path
+    return longest_path, longest_length
 
 def _prune_graph(
         graph: nx.Graph,
@@ -358,17 +359,10 @@ def _prune_graph(
 
 def _linearity(boundary, dim, height, min_ratio=0.05):
     # Voxelize or rasterize the boundary
-    if dim == 2:
-        # Scale and rasterize
+    if dim == 2: # Scale and rasterize
         img, _ = _rasterize(boundary, height=height)
-    else:
-        # Turn into voxel grid, scale by setting voxel side length
-        # TODO tests
-        bbox_sides = boundary.bounding_box.extents # axis-aligned, as voxels will be, too
-        voxel_length = bbox_sides.max() / height
-        voxelized = boundary.voxelized(voxel_length)
-        voxelized = voxelized.fill(method='holes')
-        img = voxelized.matrix*1
+    else: # Turn into voxel grid, scale by setting voxel side length
+        img = _voxelize(boundary, height=height)
 
     # Skeletonize & encode skeleton as graph
     skeleton = skeletonize(img).astype(int) ## will use method='lee' for 3D by default
@@ -376,7 +370,7 @@ def _linearity(boundary, dim, height, min_ratio=0.05):
     graph = graph.to_undirected()
 
     # Find longest path (acyclic)
-    longest_path = _find_longest_simple_path(graph)
+    longest_path, _ = _find_longest_simple_path(graph)
     longest_path_nodes = set(longest_path)
 
     # Prune 'spurious' branches while protecting the longest path
@@ -401,6 +395,14 @@ def _rasterize(boundary, height=1000):
     poly = shapely.affinity.scale(poly, scale_factor, scale_factor, origin=(0, 0, 0))
     return features.rasterize([poly], out_shape=(height, int(height * (maxx - minx) / (maxy - miny)))), scale_factor
 
+def _voxelize(boundary, height=100):
+    # TODO tests
+    bbox_sides = boundary.bounding_box.extents # axis-aligned, as voxels will be, too
+    voxel_length = bbox_sides.max() / height
+    voxelized = boundary.voxelized(voxel_length)
+    voxelized = voxelized.fill(method='holes')
+
+    return voxelized.matrix*1
 
 @d.dedent
 def linearity(
@@ -618,8 +620,99 @@ def _axes(boundary):
     mbr_lengths = [geometry.LineString((mbr_points[i], mbr_points[i + 1])).length for i in range(len(mbr_points) - 1)]
     return min(mbr_lengths), max(mbr_lengths)
 
+def _major_axis(boundary: trimesh.Trimesh) -> float:
+    # PCA on vertices to get principal axes
+    points = boundary.vertices - boundary.centroid # center points
+    eigvals, eigvecs = np.linalg.eigh(np.cov(points.T)) # correspond to principal axes
+    axis = eigvecs[:, np.argmax(eigvals)]
+    # Project points onto the major axis
+    projections = points @ axis
+    return projections.max() - projections.min()
 
-def _curl(boundary):
+def _fiber_length_cylinder(volume, area):
+    # Solve for length L in a cylinder with same V and S:
+    # V = πr^2 L
+    # S = 2πr^2 + 2πrL
+    def f(L):
+        if L <= 0:
+            return np.inf
+        r2 = volume / (np.pi * L)
+        r = np.sqrt(r2)
+        surface = 2 * np.pi * r2 + 2 * np.pi * r * L
+        return surface - area
+
+    # Use a root-finding method to find L
+    # Function must change sign within the bracketing interval
+    # Try a range of logarithmic values for L
+    # to find a root
+    L_range = np.logspace(-3, 6, 100)
+    values = [f(L) for L in L_range]
+    for i in range(len(values) - 1):
+        if values[i] * values[i + 1] < 0:
+            result = root_scalar(f, bracket=[L_range[i], L_range[i+1]], method='brentq')
+            if result.converged:
+                return result.root
+    return None # failed to solve for L, likely shape too dissimilar from cylinder
+
+def _fiber_length_cuboid(volume, area):
+    # Assume square cross-section: w² * L = V, S = 2w² + 4wL
+    def f(L):
+        if L <= 0: return np.inf
+        w2 = volume / L
+        w = np.sqrt(w2)
+        surface = 2 * w2 + 4 * w * L
+        return surface - area
+
+    # Find L (as for cylinder)
+    L_range = np.logspace(-3, 6, 100)
+    values = [f(L) for L in L_range]
+    for i in range(len(values) - 1):
+        if values[i] * values[i + 1] < 0:
+            result = root_scalar(f, bracket=[L_range[i], L_range[i+1]], method='brentq')
+            if result.converged:
+                return result.root
+    return None # failed to solve for L, likely shape too dissimilar from cuboid
+
+def _curl_3D_shape_comparison(mesh: trimesh.Trimesh) -> float:
+    if not mesh.is_watertight or mesh.volume < 1e-6 or mesh.area < 1e-6:
+        return None
+
+    V = mesh.volume
+    A = mesh.area
+    L_major = _major_axis(mesh)
+
+    # Try cylinder
+    L_fiber = _fiber_length_cylinder(V, A)
+    if L_fiber is None or L_fiber < L_major:
+        # Fall back to cuboid
+        L_fiber = _fiber_length_cuboid(V, A)
+
+    if L_fiber is None or L_fiber < L_major:
+        return None
+    return 1 - L_major / L_fiber
+
+def _curl_3D_skeleton(boundary, height=100):
+    # Turn into voxel grid, scale by setting voxel side length
+    img = _voxelize(boundary, height=height)
+
+    # Skeletonize & encode skeleton as graph
+    skeleton = skeletonize(img).astype(int) ## will use method='lee' for 3D by default
+    graph = sknw.build_sknw(skeleton.astype(np.uint16))
+    graph = graph.to_undirected()
+
+    # Find longest path (acyclic)
+    _, fiber_length = _find_longest_simple_path(graph)
+
+    # Compute major axis using PCA
+    major_axis_length = _major_axis(boundary)
+
+    # Return curl (bounded)
+    if fiber_length <= major_axis_length or fiber_length == 0:
+        return 0.0
+
+    return 1 - (major_axis_length / fiber_length)
+
+def _curl_2D(boundary):
     factor = boundary.length**2 - 16 * boundary.area
     if factor < 0:
         factor = 0
@@ -637,12 +730,18 @@ def curl(
     adata: AnnData,
     cluster_key: str = "component",
     out_key: str = "curl",
+    method_3D: str = "skeleton",
+    height: int = 100,
     copy: bool = False,
 ) -> None | dict[int, float]:
     """
     Compute the curl score of the topological boundaries of sets of cells.
 
-    It computes the curl score of each cluster as one minues the ratio between the length of the major axis of the minimum bounding rectangle and the fiber length of the polygon.
+    Given by curl = 1 - major_axis_length / fiber_length.
+    In 2D, these are the length of the major axis of the minimum bounding rectangle and the fiber length of the polygon (see Varrone et al., 2023).
+    In 3D, two methods are available:
+    - 'skeleton': The fiber length is the length of the longest path in the skeleton of the shape, computes as for the linearity score (parameter height required). This method is more likely to return a non-zero value, but is more complex (interpretability).
+    - 'shape_comparison': The fiber length is the length of a cylinder (or, as a fallback, cuboid) with the same volume and surface area as the shape. If the shape is straight and elongated, then length_major_axis ≈ fiber_length, so curl ≈ 0. If the shape is coiled, twisted, or compact, then length_major_axis << fiber_length, so curl → 1.
 
     Parameters
     ----------
@@ -650,6 +749,13 @@ def curl(
     cluster_key
         Key in :attr:`anndata.AnnData.obs` where the cluster labels are stored.
     %(copy)s
+    out_key
+        Key in :attr:`anndata.AnnData.obs` where the metric values are stored if ``copy = False``.
+    method_3D
+        Only for 3D shapes: How to calculate the curl score. Either 'skeleton' or 'shape_comparison'.
+    height
+        Only for 3D shapes: Height of the rasterized image. The lengths of the other side(s) is/are computed automatically to preserve the aspect ratio of the shape. Higher values lead to more precise results but also higher memory usage. Default is 100.
+
     Returns
     -------
     If ``copy = True``, returns a :class:`dict` with the cluster labels as keys and the curl score as values.
@@ -661,7 +767,18 @@ def curl(
     boundaries = adata.uns[f"shape_{cluster_key}"]["boundary"]
     curl_score = {}
     for cluster, boundary in boundaries.items():
-        curl_score[cluster] = _curl(boundary)
+        # Check dimensionality of boundary
+        if isinstance(boundary, geometry.Polygon) or isinstance(boundary, geometry.MultiPolygon):
+            curl_score[cluster] = _curl_2D(boundary)
+        elif isinstance(boundary, trimesh.Trimesh):
+            if method_3D == "skeleton":
+                curl_score[cluster] = _curl_3D_skeleton(boundary)
+            elif method_3D == "shape_comparison":
+                curl_score[cluster] = _curl_3D_shape_comparison(boundary)
+            else:
+                raise ValueError("Unknown method_3D. Must be either 'skeleton' or 'shape_comparison'.")
+        else:
+            curl_score[cluster] = np.nan
 
     if copy:
         return curl_score
