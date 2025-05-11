@@ -70,19 +70,19 @@ def _alphashape_optimizealpha(
 @d.dedent
 def alphashape_optimize(
     adata: AnnData,
-    component_key: str = 'component',
+    cluster_key: str = 'component',
     max_iterations: int = 10000,
     lower: float | None = None,
     upper: float | None = None,
     silent: bool = False,
-) -> tuple([ dict[int, float] , dict[int, trimesh.Trimesh] ]) | tuple([ dict[int, float] , dict[int, geometry.Polygon] ]):
+) -> tuple[ dict[int, float] , dict[int, trimesh.Trimesh] ] | tuple[ dict[int, float] , dict[int, geometry.Polygon] ]:
     """
     Function to optimize alpha using alphashape.optimizealpha.
 
     Parameters
     ----------
     %(adata)s
-    component_key
+    cluster_key
         Key in :attr:`anndata.AnnData.obs` where the component labels are stored.
     max_iterations
         Maximum number of iterations for the alpha shape optimizer.
@@ -102,7 +102,7 @@ def alphashape_optimize(
     """
     assert (adata.obsm["spatial"].shape[1] == 2) | (adata.obsm["spatial"].shape[1] == 3), "Points must be 2D or 3D."
 
-    components = [component for component in adata.obs[component_key].unique() if component != -1 and not np.isnan(component)]
+    components = [component for component in adata.obs[cluster_key].unique() if component != -1 and not np.isnan(component)]
 
     alphas = {}
     shapes = {}
@@ -110,7 +110,7 @@ def alphashape_optimize(
         futures = {
             executor.submit(
                 _alphashape_optimizealpha,
-                adata.obsm["spatial"][adata.obs[component_key] == component, :],
+                adata.obsm["spatial"][adata.obs[cluster_key] == component, :],
                 component,
                 max_iterations,
                 lower,
@@ -124,7 +124,7 @@ def alphashape_optimize(
             component, alpha_inv = future.result()
             alphas[component] = 1/alpha_inv
             if not np.isnan(alpha_inv):
-                shapes[component] = alphashape.alphashape(adata.obsm["spatial"][adata.obs[component_key] == component, :], alpha_inv)
+                shapes[component] = alphashape.alphashape(adata.obsm["spatial"][adata.obs[cluster_key] == component, :], alpha_inv)
             else:
                 shapes[component] = None
 
@@ -630,7 +630,8 @@ def _major_axis(boundary: trimesh.Trimesh) -> float:
     return projections.max() - projections.min()
 
 def _fiber_length_cylinder(volume, area):
-    # Solve for length L in a cylinder with same V and S:
+    # Solve for length L in a cylinder
+    # with same volume V and surface area S:
     # V = πr^2 L
     # S = 2πr^2 + 2πrL
     def f(L):
@@ -657,7 +658,8 @@ def _fiber_length_cylinder(volume, area):
 def _fiber_length_cuboid(volume, area):
     # Assume square cross-section: w² * L = V, S = 2w² + 4wL
     def f(L):
-        if L <= 0: return np.inf
+        if L <= 0:
+            return np.inf
         w2 = volume / L
         w = np.sqrt(w2)
         surface = 2 * w2 + 4 * w * L
@@ -772,7 +774,7 @@ def curl(
             curl_score[cluster] = _curl_2D(boundary)
         elif isinstance(boundary, trimesh.Trimesh):
             if method_3D == "skeleton":
-                curl_score[cluster] = _curl_3D_skeleton(boundary)
+                curl_score[cluster] = _curl_3D_skeleton(boundary, height=height)
             elif method_3D == "shape_comparison":
                 curl_score[cluster] = _curl_3D_shape_comparison(boundary)
             else:
@@ -822,7 +824,7 @@ def purity(
 
     purity_score = {}
     for cluster, boundary in boundaries.items():
-        sample = adata[adata.obs[cluster_key] == cluster].obs[library_key][0]
+        sample = adata[adata.obs[cluster_key] == cluster].obs[library_key].unique()[0]
         adata_sample = adata[adata.obs[library_key] == sample]
 
         points = adata_sample.obsm["spatial"]
@@ -842,17 +844,59 @@ def purity(
             purity_score[cluster] = np.sum(adata_sample.obs[cluster_key][within_mask] == cluster) / np.sum(within_mask)
 
         else: # 3D
-            # Subset points to within bounding box of boundary -> fewer dist. calculations -> faster
-            bbox = boundary.bounding_box
-            ((min_x, min_y, min_z), (max_x, max_y, max_z)) = bbox.bounds
-            within_box = (points[:,0] >= min_x) & (points[:,0] <= max_x) & (points[:,1] >= min_y) & (points[:,1] <= max_y) & (points[:,2] >= min_z) & (points[:,2] <= max_z)
             is_cluster = adata_sample.obs[cluster_key] == cluster
-            points_other = np.array(points)[ within_box & (~is_cluster) , :] # only points that are not part of cluster
-            # Compute signed distances: positive if inside, negative if outside
-            within_mask_other = trimesh.proximity.ProximityQuery( boundary ).signed_distance(points_other) > 0
 
-            purity_score[cluster] = np.sum(is_cluster) / ( np.sum(is_cluster) + np.sum(within_mask_other) )
+            # Init masks for all points of other clusters
+            not_cluster_within_bounds = np.zeros(points.shape[0], dtype=bool)
+            other_cluster_mask = ~is_cluster
+            other_cluster_points = points[other_cluster_mask, :]
 
+            # Catch RuntimeWarning: overflow encountered in divide
+            # t[nonzero] = (axis_bound[nonzero] - axis_ori[nonzero]) / axis_dir[nonzero]
+            try:
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always", RuntimeWarning)
+
+                    # Try full contains() call
+                    result = boundary.contains(other_cluster_points)
+
+                    # If RuntimeWarning caught, do fallback for points near mesh
+                    if any(issubclass(warn.category, RuntimeWarning) for warn in w):
+                        # Identify "nearby" points for fallback
+                        bbox = boundary.bounding_box
+                        ((min_x, min_y, min_z), (max_x, max_y, max_z)) = bbox.bounds
+                        within_box = (
+                            (points[:, 0] >= min_x) & (points[:, 0] <= max_x) &
+                            (points[:, 1] >= min_y) & (points[:, 1] <= max_y) &
+                            (points[:, 2] >= min_z) & (points[:, 2] <= max_z)
+                        )
+                        fallback_indices = np.where(within_box & other_cluster_mask)[0]
+                        fallback_points = points[fallback_indices]
+
+                        # Per-point containment for only these
+                        for i, idx in enumerate(fallback_indices):
+                            point = fallback_points[i]
+                            try:
+                                with warnings.catch_warnings(record=True) as single_w:
+                                    warnings.simplefilter("always", RuntimeWarning)
+                                    res = boundary.contains([point])[0]
+                                    if any(issubclass(w.category, RuntimeWarning) for w in single_w):
+                                        res = True  # fallback to inside
+                                not_cluster_within_bounds[idx] = res
+                            except Exception as e:
+                                print(f"Error at point {idx}: {e}")
+                                not_cluster_within_bounds[idx] = True
+
+                    else:
+                        # If no warning, accept result for full shape
+                        not_cluster_within_bounds[other_cluster_mask] = result
+
+            except Exception as e:
+                print(f"Purity check failed for shape {cluster}: {e}")
+                # Fallback: assume inside
+                not_cluster_within_bounds[other_cluster_mask] = True
+
+            purity_score[cluster] = np.sum(is_cluster) / ( np.sum(is_cluster) + np.sum(not_cluster_within_bounds) )
 
     if copy:
         return purity_score
